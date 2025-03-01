@@ -6,33 +6,6 @@ use core::future::poll_fn;
 use core::mem::MaybeUninit;
 use core::task::Poll;
 
-use bt_hci::cmd::controller_baseband::{
-    HostBufferSize, HostNumberOfCompletedPackets, Reset, SetControllerToHostFlowControl, SetEventMask,
-};
-use bt_hci::cmd::le::{
-    LeConnUpdate, LeCreateConnCancel, LeReadBufferSize, LeReadFilterAcceptListSize, LeSetAdvEnable, LeSetEventMask,
-    LeSetExtAdvEnable, LeSetExtScanEnable, LeSetRandomAddr, LeSetScanEnable,
-};
-use bt_hci::cmd::link_control::Disconnect;
-use bt_hci::cmd::{AsyncCmd, SyncCmd};
-use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync, blocking};
-use bt_hci::data::{AclBroadcastFlag, AclPacket, AclPacketBoundary};
-use bt_hci::event::le::LeEvent;
-use bt_hci::event::{Event, Vendor};
-use bt_hci::param::{
-    AddrKind, AdvHandle, AdvSet, BdAddr, ConnHandle, DisconnectReason, EventMask, FilterDuplicates, LeConnRole,
-    LeEventMask, Status,
-};
-#[cfg(feature = "controller-host-flow-control")]
-use bt_hci::param::{ConnHandleCompletedPackets, ControllerToHostFlowControl};
-use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
-use embassy_futures::select::{Either3, Either4, select3, select4};
-use embassy_sync::once_lock::OnceLock;
-use embassy_sync::waitqueue::WakerRegistration;
-#[cfg(feature = "gatt")]
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
-use futures::pin_mut;
-
 use crate::att::{AttClient, AttServer};
 use crate::channel_manager::{ChannelManager, ChannelStorage, PacketChannel};
 use crate::command::CommandState;
@@ -47,6 +20,36 @@ use crate::types::l2cap::{
     L2CAP_CID_ATT, L2CAP_CID_DYN_START, L2CAP_CID_LE_U_SIGNAL, L2capHeader, L2capSignal, L2capSignalHeader,
 };
 use crate::{Address, BleHostError, Error, Stack, att, config};
+use bt_hci::cmd::controller_baseband::{
+    HostBufferSize, HostNumberOfCompletedPackets, Reset, SetControllerToHostFlowControl, SetEventMask,
+};
+use bt_hci::cmd::le::{
+    LeConnUpdate, LeCreateConnCancel, LeReadBufferSize, LeReadFilterAcceptListSize, LeSetAdvEnable, LeSetEventMask,
+    LeSetExtAdvEnable, LeSetExtScanEnable, LeSetRandomAddr, LeSetScanEnable,
+};
+use bt_hci::cmd::link_control::Disconnect;
+use bt_hci::cmd::{AsyncCmd, SyncCmd};
+use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync, blocking};
+use bt_hci::data::{AclBroadcastFlag, AclPacket, AclPacketBoundary};
+use bt_hci::event::le::LeEvent;
+use bt_hci::event::{Event, Vendor};
+use bt_hci::param::{
+    AddrKind, AdvHandle, AdvSet, BdAddr, ConnHandle, DisconnectReason, EventMask, FilterDuplicates, LeAdvEventKind,
+    LeAdvReport, LeConnRole, LeEventMask, Status,
+};
+#[cfg(feature = "controller-host-flow-control")]
+use bt_hci::param::{ConnHandleCompletedPackets, ControllerToHostFlowControl};
+use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
+use embassy_futures::select::{Either3, Either4, select3, select4};
+use embassy_sync::channel::{DynamicReceiver, Receiver};
+use embassy_sync::once_lock::OnceLock;
+use embassy_sync::signal::Signal;
+use embassy_sync::waitqueue::WakerRegistration;
+use embassy_sync::watch::DynReceiver;
+#[cfg(feature = "gatt")]
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
+use futures::{StreamExt, pin_mut};
+use heapless::Vec;
 
 /// A BLE Host.
 ///
@@ -533,6 +536,7 @@ pub struct Runner<'d, C> {
 /// The receiver part of the host runner.
 pub struct RxRunner<'d, C> {
     stack: &'d Stack<'d, C>,
+    channel: Channel<NoopRawMutex, AdvReport, 1>,
 }
 
 /// The control part of the host runner.
@@ -563,7 +567,10 @@ impl EventHandler for DummyHandler {}
 impl<'d, C: Controller> Runner<'d, C> {
     pub(crate) fn new(stack: &'d Stack<'d, C>) -> Self {
         Self {
-            rx: RxRunner { stack },
+            rx: RxRunner {
+                stack,
+                channel: Channel::new(),
+            },
             control: ControlRunner { stack },
             tx: TxRunner { stack },
         }
@@ -572,6 +579,13 @@ impl<'d, C: Controller> Runner<'d, C> {
     /// Split the runner into separate independent async tasks
     pub fn split(self) -> (RxRunner<'d, C>, ControlRunner<'d, C>, TxRunner<'d, C>) {
         (self.rx, self.control, self.tx)
+    }
+
+    pub fn receiver<'e>(&'e self) -> DynamicReceiver<'e, AdvReport>
+    where
+        'd: 'e,
+    {
+        self.rx.channel.dyn_receiver()
     }
 
     /// Run the host.
@@ -594,12 +608,15 @@ impl<'d, C: Controller> Runner<'d, C> {
             + for<'t> ControllerCmdSync<HostNumberOfCompletedPackets<'t>>
             + ControllerCmdSync<LeReadBufferSize>,
     {
-        let dummy = DummyHandler;
-        self.run_with_handler(&dummy).await
+        let a = async |v| {};
+        self.run_with_handler(a).await
     }
 
     /// Run the host with a vendor event handler for custom events.
-    pub async fn run_with_handler<E: EventHandler>(&mut self, event_handler: &E) -> Result<(), BleHostError<C::Error>>
+    pub async fn run_with_handler<E: AsyncFn(AdvReport) -> ()>(
+        &self,
+        event_handler: E,
+    ) -> Result<(), BleHostError<C::Error>>
     where
         C: ControllerCmdSync<Disconnect>
             + ControllerCmdSync<SetEventMask>
@@ -618,6 +635,7 @@ impl<'d, C: Controller> Runner<'d, C> {
             + ControllerCmdSync<LeCreateConnCancel>
             + ControllerCmdSync<LeReadBufferSize>,
     {
+        let receiver = self.rx.channel.receiver().clone();
         let control_fut = self.control.run();
         let rx_fut = self.rx.run_with_handler(event_handler);
         let tx_fut = self.tx.run();
@@ -639,20 +657,32 @@ impl<'d, C: Controller> Runner<'d, C> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct AdvReport {
+    pub event_kind: LeAdvEventKind,
+    pub addr_kind: AddrKind,
+    pub addr: BdAddr,
+    pub data: Vec<u8, 31>,
+    pub rssi: i8,
+}
+
 impl<'d, C: Controller> RxRunner<'d, C> {
     /// Run the receive loop that polls the controller for events.
     pub async fn run(&mut self) -> Result<(), BleHostError<C::Error>>
     where
         C: ControllerCmdSync<Disconnect>,
     {
-        let dummy = DummyHandler;
-        self.run_with_handler(&dummy).await
+        let a = async move |v: AdvReport| {
+            // No impl, do nothing
+        };
+        self.run_with_handler(&a).await
     }
 
     /// Runs the receive loop that pools the controller for events, dispatching
     /// vendor events to the provided closure.
-    pub async fn run_with_handler<E: EventHandler>(&mut self, event_handler: &E) -> Result<(), BleHostError<C::Error>>
+    pub async fn run_with_handler<E>(&self, event_handler: E) -> Result<(), BleHostError<C::Error>>
     where
+        E: AsyncFn(AdvReport) -> (),
         C: ControllerCmdSync<Disconnect>,
     {
         const MAX_HCI_PACKET_LEN: usize = 259;
@@ -724,16 +754,23 @@ impl<'d, C: Controller> RxRunner<'d, C> {
                             LeEvent::LeAdvertisingSetTerminated(set) => {
                                 host.advertise_state.terminate(set.adv_handle);
                             }
-                            LeEvent::LeExtendedAdvertisingReport(data) => {
+                            LeEvent::LeExtendedAdvertisingReport(data) => {}
+                            LeEvent::LeAdvertisingReport(mut data) => {
                                 #[cfg(feature = "scan")]
                                 {
-                                    event_handler.on_ext_adv_reports(data.reports.iter());
-                                }
-                            }
-                            LeEvent::LeAdvertisingReport(data) => {
-                                #[cfg(feature = "scan")]
-                                {
-                                    event_handler.on_adv_reports(data.reports.iter());
+                                    let mut iterator = data.reports.iter();
+                                    while let Some(Ok(report)) = iterator.next() {
+                                        let bytes = Vec::<u8, 31>::from_slice(report.data).unwrap();
+
+                                        event_handler(AdvReport {
+                                            event_kind: report.event_kind,
+                                            addr: report.addr,
+                                            addr_kind: report.addr_kind,
+                                            data: bytes,
+                                            rssi: report.rssi,
+                                        })
+                                        .await;
+                                    }
                                 }
                             }
                             _ => {
@@ -778,7 +815,7 @@ impl<'d, C: Controller> RxRunner<'d, C> {
                             }
                         }
                         Event::Vendor(vendor) => {
-                            event_handler.on_vendor(&vendor);
+                            //event_handler.on_vendor(&vendor);
                         }
                         // Ignore
                         _ => {}
@@ -796,7 +833,7 @@ impl<'d, C: Controller> RxRunner<'d, C> {
 
 impl<'d, C: Controller> ControlRunner<'d, C> {
     /// Run the control loop for the host
-    pub async fn run(&mut self) -> Result<(), BleHostError<C::Error>>
+    pub async fn run(&self) -> Result<(), BleHostError<C::Error>>
     where
         C: ControllerCmdSync<Disconnect>
             + ControllerCmdSync<SetEventMask>
@@ -969,7 +1006,7 @@ impl<'d, C: Controller> ControlRunner<'d, C> {
 
 impl<'d, C: Controller> TxRunner<'d, C> {
     /// Run the transmit loop for the host.
-    pub async fn run(&mut self) -> Result<(), BleHostError<C::Error>> {
+    pub async fn run(&self) -> Result<(), BleHostError<C::Error>> {
         let host = &self.stack.host;
         let params = host.initialized.get().await;
         loop {

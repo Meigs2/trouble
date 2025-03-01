@@ -9,15 +9,14 @@ use trouble_host::prelude::*;
 /// Max number of connections
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 1;
-const L2CAP_MTU: usize = 27;
 
-pub async fn run<C>(controller: C)
+pub async fn run<C, const L2CAP_MTU: usize>(controller: C)
 where
     C: Controller + ControllerCmdSync<LeSetScanParams>,
 {
     // Using a fixed "random" address can be useful for testing. In real scenarios, one would
     // use e.g. the MAC 6 byte array as the address (how to get that varies by the platform).
-    let address: Address = Address::random([0xff, 0x8f, 0x1b, 0x05, 0xe4, 0xff]);
+    let mut address: Address = Address::random([0xff, 0x8f, 0x1b, 0x05, 0xe4, 0xff]);
 
     info!("Our address = {:?}", address);
     let mut resources: HostResources<CONNECTIONS_MAX, L2CAP_CHANNELS_MAX, L2CAP_MTU> = HostResources::new();
@@ -26,33 +25,13 @@ where
         central, mut runner, ..
     } = stack.build();
 
-    let printer = Printer {
-        seen: RefCell::new(Deque::new()),
-    };
+    let addresses: RefCell<Deque<BdAddr, 128>> = RefCell::new(Deque::new());
+
+    let receiver = runner.receiver();
     let mut scanner = Scanner::new(central);
-    let _ = join(runner.run_with_handler(&printer), async {
-        let mut config = ScanConfig::default();
-        config.active = true;
-        config.phys = PhySet::M1;
-        config.interval = Duration::from_secs(1);
-        config.window = Duration::from_secs(1);
-        let mut _session = scanner.scan(&config).await.unwrap();
-        // Scan forever
-        loop {
-            Timer::after(Duration::from_secs(1)).await;
-        }
-    })
-    .await;
-}
-
-struct Printer {
-    seen: RefCell<Deque<BdAddr, 128>>,
-}
-
-impl EventHandler for Printer {
-    fn on_adv_reports(&self, mut it: LeAdvReportsIter<'_>) {
-        let mut seen = self.seen.borrow_mut();
-        while let Some(Ok(report)) = it.next() {
+    let _ = join(
+        runner.run_with_handler(async |report| {
+            let mut seen = addresses.borrow_mut();
             if seen.iter().find(|b| b.raw() == report.addr.raw()).is_none() {
                 info!("discovered: {:?}", report.addr);
                 if seen.is_full() {
@@ -60,6 +39,20 @@ impl EventHandler for Printer {
                 }
                 seen.push_back(report.addr).unwrap();
             }
-        }
-    }
+        }),
+        async {
+            let mut config = ScanConfig::default();
+            config.active = true;
+            config.phys = PhySet::M1;
+            config.interval = Duration::from_secs(1);
+            config.window = Duration::from_secs(1);
+            let _session = scanner.scan(&config).await.unwrap();
+            // Scan forever
+            info!("Starting to scan");
+            loop {
+                Timer::after(Duration::from_secs(1)).await;
+            }
+        },
+    )
+    .await;
 }
